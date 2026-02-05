@@ -25,18 +25,50 @@ export async function POST(request: Request) {
     }
 
     try {
-        // 2. Upload to Supabase Storage (Optional for MVP speed, we process on fly)
-        // const { data, error } = await supabase.storage.from('uploads').upload(`${userId}/${Date.now()}_${file.name}`, file)
+        // 2. Upload to Supabase Storage
+        const filename = `${userId}/${Date.now()}_${file.name.replace(/\s+/g, '_')}`;
+        const { data: storageData, error: storageError } = await supabase.storage
+            .from('uploads')
+            .upload(filename, file);
 
-        // 3. Process with OCR
+        if (storageError) {
+            console.error('Storage upload error:', storageError);
+            // We continue execution even if storage fails? 
+            // Ideally yes for the user, but for training data collection we might want to warn.
+            // For now, log and proceed, but we won't have an upload_id.
+        }
+
+        // 3. Create Upload Record in DB
+        let uploadId = null;
+        if (storageData) {
+            const { data: uploadRecord, error: uploadDbError } = await supabase
+                .from('uploads')
+                .insert({
+                    user_id: userId,
+                    file_path: filename,
+                    original_filename: file.name,
+                    status: 'processing' // Initial status
+                })
+                .select()
+                .single();
+
+            if (uploadRecord) uploadId = uploadRecord.id;
+        }
+
+        // 4. Process with OCR
         const base64 = await fileToBase64(file);
         const shifts = await parseShiftScreenshot(base64);
 
         if (shifts.length === 0) {
+            // Update upload status to failed if no shifts
+            if (uploadId) await supabase.from('uploads').update({ status: 'failed' }).eq('id', uploadId);
             return NextResponse.json({ message: 'No shifts found in image' }, { status: 422 });
         }
 
-        // 4. Score and Save Shifts
+        // Update upload status to completed
+        if (uploadId) await supabase.from('uploads').update({ status: 'completed' }).eq('id', uploadId);
+
+        // 5. Score and Save Shifts
         const processedShifts = [];
 
         // Fetch user profile for home location
@@ -93,6 +125,7 @@ export async function POST(request: Request) {
 
             const { data: insertedShift, error } = await supabase.from('shifts').insert({
                 user_id: userId,
+                upload_id: uploadId, // Link to the source image
                 hospital_name: shift.hospital_name,
                 ward_name: shift.ward_name,
                 shift_date: shift.shift_date,
